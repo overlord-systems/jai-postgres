@@ -127,9 +127,10 @@ UUID :: [16]u8;
 
 // UUIDs are just two s64 values, so equality is simply comparing each
 // of the two s64 values to each other from u1 and u2
-uuid_equal :: (u1: UUID, u2: UUID) -> bool {
-    a, b := u1.([2]s64,force), u2.([2]s64,force);
-    return a[0] == b[0] && a[1] == b[1];
+uuid_equal :: inline (u1: Uuid, u2: Uuid) -> bool {
+    u1_s64 := u1.data.(*s64);
+    u2_s64 := u2.data.(*s64);
+    return u1_s64.* == u2_s64.* && (u1_s64 + 1).* == (u2_s64 + 1).*;
 }
 
 uuid_to_string :: (uuid: UUID) -> string {
