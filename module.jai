@@ -456,6 +456,13 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
             }
 
         case;
+
+            // See if we have a handler that knows how to deal with this type
+            for pg_custom_type_handlers {
+                if it.oid != col_type.(Oid) continue;
+                return it.handler(name, info, slot, col_type, len, data, row, col);
+            }
+
             if cast(s64) col_type > enum_highest_value(Pq_Type) {
                 // Seems to be a custom type. Try to interpret it as a string
                 val: string;
@@ -617,6 +624,7 @@ Reflection :: #import "Reflection";
 
 #load "byte_order.jai";
 #load "pq_types.jai";
+#load "custom_type_handling.jai";
 
 #if OS == .WINDOWS {
     Windows :: #import "Windows";

@@ -98,16 +98,39 @@ main :: () {
     assert(result.varchar       == "");
     assert(result.text          == "Something");
 
+    test_register_handlers(conn);
+
     log("ALL OK");
+}
+
+test_register_handlers :: (conn: *PGconn) {
+
+    err_msg := register_pgvector_handler(conn);
+    if #complete err_msg == {
+
+        // OK means you can now run and parse queries returning the 'vector' type from pgvector
+        case .OK;
+            return;
+
+        case .QUERY_ERR;
+            assert(false, "Error querying for the pgvector.vector oid");
+
+        case .NOT_INSTALLED;
+            log("Didn't find the pgvector.vector type in your DB. Seems you don't have pgvector installed on your postgres DB", flags=.WARNING);
+
+        case .REGISTER_ERR;
+            assert(false, "Found the pgvector.vector OID in your postgres DB, but failed to register it with jai-postgres!");
+    }
 }
 
 UUID :: [16]u8;
 
 // UUIDs are just two s64 values, so equality is simply comparing each
 // of the two s64 values to each other from u1 and u2
-uuid_equal :: (u1: UUID, u2: UUID) -> bool {
-    a, b := u1.([2]s64,force), u2.([2]s64,force);
-    return a[0] == b[0] && a[1] == b[1];
+uuid_equal :: inline (u1: Uuid, u2: Uuid) -> bool {
+    u1_s64 := u1.data.(*s64);
+    u2_s64 := u2.data.(*s64);
+    return u1_s64.* == u2_s64.* && (u1_s64 + 1).* == (u2_s64 + 1).*;
 }
 
 uuid_to_string :: (uuid: UUID) -> string {
@@ -161,4 +184,6 @@ Test :: struct {
 }
 
 #import,file "../module.jai";
+#import,file "Jaipgvector.jai";
 #import "Basic";
+
