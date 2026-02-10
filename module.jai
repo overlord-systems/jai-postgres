@@ -87,15 +87,15 @@ send_query :: (conn: *PGconn, command: string, args: .. Any) -> success: bool {
                 if info.runtime_size == {
                     case 2;
                         param_types[index] = cast(Oid) Pq_Type.INT2;
-                        be_val := hton(<<(cast(*s16) arg.value_pointer));
+                        be_val := hton((.*)(cast(*s16) arg.value_pointer));
                         memcpy(be_value, *be_val, info.runtime_size);
                     case 4;
                         param_types[index] = cast(Oid) Pq_Type.INT4;
-                        be_val := hton(<<(cast(*s32) arg.value_pointer));
+                        be_val := hton((.*)(cast(*s32) arg.value_pointer));
                         memcpy(be_value, *be_val, info.runtime_size);
                     case 8;
                         param_types[index] = cast(Oid) Pq_Type.INT8;
-                        be_val := hton(<<(cast(*s64) arg.value_pointer));
+                        be_val := hton((.*)(cast(*s64) arg.value_pointer));
                         memcpy(be_value, *be_val, info.runtime_size);
                     case;
                         assert(false);
@@ -108,12 +108,12 @@ send_query :: (conn: *PGconn, command: string, args: .. Any) -> success: bool {
                 be_value := cast(*u8) alloc(arg.type.runtime_size);
                 if arg.type.runtime_size == 4 {
                     param_types[index] = cast(Oid) Pq_Type.FLOAT4;
-                    be_val := hton(<<(cast(*float) arg.value_pointer));
+                    be_val := hton((.*)(cast(*float) arg.value_pointer));
                     memcpy(be_value, *be_val, arg.type.runtime_size);
                 }
                 if arg.type.runtime_size == 8 {
                     param_types[index] = cast(Oid) Pq_Type.FLOAT8;
-                    be_val := hton(<<(cast(*float64) arg.value_pointer));
+                    be_val := hton((.*)(cast(*float64) arg.value_pointer));
                     memcpy(be_value, *be_val, arg.type.runtime_size);
                 }
                 param_values[index]  = be_value;
@@ -254,7 +254,7 @@ get_results :: (query_res: *PGresult, info: *Type_Info, ignore_unknown := false)
         name.count = c_style_strlen(name.data);
         member, offset_in_bytes := get_field(info_struct, name);
         if !ignore_unknown && !member {
-            log_error("Column \"%\" has no corresponding member in struct type \"%\"", name, <<info_struct);
+            log_error("Column \"%\" has no corresponding member in struct type \"%\"", name, info_struct.*);
             return results, false;
         }
         column_members[col] = .{member, offset_in_bytes};
@@ -292,19 +292,19 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
         case .INT2;
             assert(len == 2);
             // Explicitly throwing away 48 bits.
-            val := ntoh(<< cast(*s16) data);
+            val := ntoh((.*) cast(*s16) data);
             return write_integer(col, name, info, slot, col_type, val);
 
         case .OID; #through;
         case .INT4;
             assert(len == 4);
             // Explicitly throwing away 32 bits.
-            val := ntoh(<< cast(*s32) data);
+            val := ntoh((.*) cast(*s32) data);
             return write_integer(col, name, info, slot, col_type, val);
 
         case .INT8;
             assert(len == 8);
-            val := ntoh(<< cast(*s64) data);
+            val := ntoh((.*) cast(*s64) data);
             return write_integer(col, name, info, slot, col_type, val);
 
         case .FLOAT4;
@@ -314,10 +314,10 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
             }
 
             if info.runtime_size == 4 {
-                << (cast(*float32) slot) = ntoh(<<(cast(*float32) data));
+                (.*) (cast(*float32) slot) = ntoh((.*)(cast(*float32) data));
             } else {
                 assert(info.runtime_size == 8);
-                << (cast(*float64) slot) = cast(float64) ntoh(<<(cast(*float32) data));
+                (.*) (cast(*float64) slot) = cast(float64) ntoh((.*)(cast(*float32) data));
             }
             return true;
 
@@ -328,10 +328,10 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
             }
 
             if info.runtime_size == 4 {
-                << (cast(*float32) slot) = cast(float32) ntoh(<<(cast(*float64) data));
+                (.*) (cast(*float32) slot) = cast(float32) ntoh((.*)(cast(*float64) data));
             } else {
                 assert(info.runtime_size == 8);
-                << (cast(*float64) slot) = ntoh(<<(cast(*float64) data));
+                (.*) (cast(*float64) slot) = ntoh((.*)(cast(*float64) data));
             }
             return true;
 
@@ -341,7 +341,7 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
                 return false;
             }
             success: bool;
-            << (cast(*string) slot), success = str_from_numeric(data, len, row, col);
+            (.*) (cast(*string) slot), success = str_from_numeric(data, len, row, col);
             return success;
 
         case .BOOL;
@@ -351,8 +351,8 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
                 return false;
             }
 
-            val := << cast(*u8) data;
-            << (cast(*bool) slot) = (val != 0);
+            val := (.*) cast(*u8) data;
+            (.*) (cast(*bool) slot) = (val != 0);
 
             return true;
 
@@ -369,7 +369,7 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
 
         case .DATE;
             assert(len == 4);
-            days_since_2000_01_01 := ntoh(<< cast(*s32) data);
+            days_since_2000_01_01 := ntoh((.*) cast(*s32) data);
             if info.type == Type_Info_Tag.INTEGER {
                 return write_integer(col, name, info, slot, col_type, days_since_2000_01_01);
             } else {
@@ -379,11 +379,11 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
                     add(*date, days_since_2000_01_01, .DAY);
                     if info == type_info(Date) {
                         target := cast(*Date) slot;
-                        <<target = date;
+                        target.* = date;
                         return true;
                     } else if info == type_info(Apollo_Time) {
                         target := cast(*Apollo_Time) slot;
-                        <<target = to_apollo_time(date);
+                        target.* = to_apollo_time(date);
                         return true;
                     } else {
                         date_string := string_from_date(date, .ISO);
@@ -396,7 +396,7 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
             }
         case .TIMESTAMP;   #through;
         case .TIMESTAMPTZ;
-            val := ntoh(<< cast(*s64) data);
+            val := ntoh((.*) cast(*s64) data);
             // shift from 2000 to 1970
             val += 946_684_800_000000;
             if info.type == .STRING || info == type_info(Apollo_Time) {
@@ -407,7 +407,7 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
 
                 if info == type_info(Apollo_Time) {
                     target := cast(*Apollo_Time) slot;
-                    <<target = apollo;
+                    target.* = apollo;
                     return true;
                 } else {
                     calendar := to_calendar(apollo);
@@ -479,7 +479,7 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
 write_string_value :: (col: int, name: string, info: *Type_Info, slot: *void, col_type: Pq_Type, value: string, is_custom: bool) -> bool {
     if info.type == {
         case .STRING;
-            << (cast(*string) slot) = copy_string(value);
+            (.*) (cast(*string) slot) = copy_string(value);
             return true;
         case .ENUM;
             info_enum := cast(*Type_Info_Enum) info;
@@ -533,10 +533,10 @@ str_from_numeric :: (data: *u8, len: int, row: int, col: int) -> string, success
         return "", false;
     }
 
-    num_digits := ntoh(<< cast(*u16) data);
-    weight := ntoh(<< cast(*s16) (data + 2));
-    sign := ntoh(<< cast(*u16) (data + 4));
-    dscale := ntoh(<< cast(*u16) (data + 6));
+    num_digits := ntoh((.*) cast(*u16) data);
+    weight := ntoh((.*) cast(*s16) (data + 2));
+    sign := ntoh((.*) cast(*u16) (data + 4));
+    dscale := ntoh((.*) cast(*u16) (data + 6));
     if len != num_digits * 2 + 8 {
         log_error("Invalid numeric length at row % col %: %", row, col, len);
         return "", false;
@@ -567,7 +567,7 @@ str_from_numeric :: (data: *u8, len: int, row: int, col: int) -> string, success
     if weight >= 0 && num_digits {
         min_digits := 1;
         while weight >= 0 && index < num_digits {
-            digit := ntoh(<< cast(*s16) (data + 8 + index * 2));
+            digit := ntoh((.*) cast(*s16) (data + 8 + index * 2));
             print_to_builder(*builder, "%", formatInt(digit, minimum_digits=min_digits));
             min_digits = 4;
             weight -= 1;
@@ -597,7 +597,7 @@ str_from_numeric :: (data: *u8, len: int, row: int, col: int) -> string, success
     }
     min_digits := 4;
     while index < num_digits {
-        digit := ntoh(<< cast(*s16) (data + 8 + index * 2));
+        digit := ntoh((.*) cast(*s16) (data + 8 + index * 2));
         if dec_len + 4 > dscale {
             remaining := dscale - dec_len;
             assert(remaining > 0, "Unexpected number of remaining digits: %", remaining);
