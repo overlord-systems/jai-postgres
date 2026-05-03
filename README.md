@@ -13,7 +13,7 @@ Among the changes made:
 - New cast syntax (`x.(int)` instead of `cast(int)x`)
 - A number of bug fixes or handling of different cases
 
-Many of these would be good to upstream, but this fork is to have changes the might not make sense upstream and to move at the required speed for the company.
+Many of these would be good to upstream, but this fork is to have changes that might not make sense upstream and to move at the required speed for the company and take creative freedom with these bindings.
 
 This module contains `libpq` bindings as well as some higher-level functions for…
 * … connecting to a Postgresql database,
