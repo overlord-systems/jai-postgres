@@ -1,13 +1,23 @@
 # Postgresql client for Jai
 
 This is a fork from [here](https://github.com/overlord-systems/jai-postgres).
+This fork is mainly to fulfill the needs of Overlord Systems.
+
+You are welcome to use this if it fits you.
+
+Among the changes made:
+
+- Async API
+- Reduced logs
+- New cast syntax (`x.(int)` instead of `cast(int)x`)
+- A number of bug fixes or handling of different cases
+
+Many of these would be good to upstream, but this fork is to have changes the might not make sense upstream and to move at the required speed for the company.
 
 This module contains `libpq` bindings as well as some higher-level functions for…
 * … connecting to a Postgresql database,
 * … executing parameterized queries and
 * … optionally parsing the results into a typed array.
-
-It only supports synchronous execution for now.
 
 ## Usage
 
