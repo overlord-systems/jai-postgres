@@ -9,7 +9,7 @@ Among the changes made:
 
 - Async API
 - Reduced logs
-- Pre-built binaries in the repo; static if possible
+- Pre-built binaries (Postgres 17) in the repo; static if possible
 - New cast syntax (`x.(int)` instead of `cast(int)x`)
 - A number of bug fixes or handling of different cases
 
