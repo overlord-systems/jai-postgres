@@ -3,13 +3,13 @@ Pg_Type_Handler :: #type (name: string, info: *Type_Info, slot: *u8, col_type: P
 register_pg_type_handler :: (oid: Oid, name: string, handler: Pg_Type_Handler) -> (success: bool) {
 
     for pg_custom_type_handlers {
-        
+
         if it.oid == oid {
             return false;
         }
     }
 
-    array_add(*pg_custom_type_handlers, .{
+    array_add(*pg_custom_type_handlers, {
             oid = oid,
             name = copy_string(name),
             handler = handler,
@@ -20,9 +20,9 @@ register_pg_type_handler :: (oid: Oid, name: string, handler: Pg_Type_Handler) -
 }
 
 remove_pg_type_handler :: (oid: Oid) -> (success: bool) {
-    
+
     for pg_custom_type_handlers {
-        
+
         if it.oid == oid {
             free(it.name);
             remove it;

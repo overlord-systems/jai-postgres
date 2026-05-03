@@ -2,3 +2,4 @@
 pgtest
 examples/example
 *.dSYM
+.DS_Store

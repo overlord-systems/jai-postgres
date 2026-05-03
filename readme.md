@@ -1,4 +1,6 @@
-# Mimimal Postgresql client for Jai
+# Postgresql client for Jai
+
+This is a fork from [here](https://github.com/overlord-systems/jai-postgres).
 
 This module contains `libpq` bindings as well as some higher-level functions for…
 * … connecting to a Postgresql database,
@@ -26,7 +28,7 @@ success = execute(conn, "SELECT pg_catalog.set_config('search_path', 'public', f
 
 … or execute a query and automatically parse the result into an array of any given type:
 
-```Jai 
+```Jai
 query :: #string END
 	SELECT * FROM tourist_attractions
 	WHERE city = $1 AND price < $2 AND min_age < $3

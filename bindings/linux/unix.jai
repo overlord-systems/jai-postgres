@@ -8,10 +8,34 @@
 
 InvalidOid :: cast(Oid) 0;
 
+LIBPQ_HAS_PIPELINING :: 1;
+
+LIBPQ_HAS_TRACE_FLAGS :: 1;
+
+LIBPQ_HAS_SSL_LIBRARY_DETECTION :: 1;
+
+LIBPQ_HAS_ASYNC_CANCEL :: 1;
+
+LIBPQ_HAS_CHANGE_PASSWORD :: 1;
+
+LIBPQ_HAS_CHUNK_MODE :: 1;
+
+LIBPQ_HAS_CLOSE_PREPARED :: 1;
+
+LIBPQ_HAS_SEND_PIPELINE_SYNC :: 1;
+
+LIBPQ_HAS_SOCKET_POLL :: 1;
+
 PG_COPYRES_ATTRS :: 0x01;
 PG_COPYRES_TUPLES :: 0x02;
 PG_COPYRES_EVENTS :: 0x04;
 PG_COPYRES_NOTICEHOOKS :: 0x08;
+
+PQTRACE_SUPPRESS_TIMESTAMPS :: 1<<0;
+
+PQTRACE_REGRESS_MODE :: 1<<1;
+
+PQ_QUERY_PARAM_MAX_LIMIT :: 65535;
 
 PQnoPasswordSupplied :: "fe_sendauth: no password supplied\n";
 
@@ -42,8 +66,12 @@ ConnStatusType :: enum u32 {
     CONNECTION_SSL_STARTUP       :: 7;
     CONNECTION_NEEDED            :: 8;
     CONNECTION_CHECK_WRITABLE    :: 9;
-
     CONNECTION_CONSUME           :: 10;
+    CONNECTION_GSS_STARTUP       :: 11;
+    CONNECTION_CHECK_TARGET      :: 12;
+
+    CONNECTION_CHECK_STANDBY     :: 13;
+    CONNECTION_ALLOCATED         :: 14;
 }
 
 PostgresPollingStatusType :: enum u32 {
@@ -55,19 +83,23 @@ PostgresPollingStatusType :: enum u32 {
 }
 
 ExecStatusType :: enum u32 {
-    PGRES_EMPTY_QUERY    :: 0;
-    PGRES_COMMAND_OK     :: 1;
+    PGRES_EMPTY_QUERY      :: 0;
+    PGRES_COMMAND_OK       :: 1;
 
-    PGRES_TUPLES_OK      :: 2;
+    PGRES_TUPLES_OK        :: 2;
 
-    PGRES_COPY_OUT       :: 3;
-    PGRES_COPY_IN        :: 4;
-    PGRES_BAD_RESPONSE   :: 5;
+    PGRES_COPY_OUT         :: 3;
+    PGRES_COPY_IN          :: 4;
+    PGRES_BAD_RESPONSE     :: 5;
 
-    PGRES_NONFATAL_ERROR :: 6;
-    PGRES_FATAL_ERROR    :: 7;
-    PGRES_COPY_BOTH      :: 8;
-    PGRES_SINGLE_TUPLE   :: 9;
+    PGRES_NONFATAL_ERROR   :: 6;
+    PGRES_FATAL_ERROR      :: 7;
+    PGRES_COPY_BOTH        :: 8;
+    PGRES_SINGLE_TUPLE     :: 9;
+    PGRES_PIPELINE_SYNC    :: 10;
+    PGRES_PIPELINE_ABORTED :: 11;
+
+    PGRES_TUPLES_CHUNK     :: 12;
 }
 
 PGTransactionStatusType :: enum u32 {
@@ -79,9 +111,10 @@ PGTransactionStatusType :: enum u32 {
 }
 
 PGVerbosity :: enum u32 {
-    PQERRORS_TERSE   :: 0;
-    PQERRORS_DEFAULT :: 1;
-    PQERRORS_VERBOSE :: 2;
+    PQERRORS_TERSE    :: 0;
+    PQERRORS_DEFAULT  :: 1;
+    PQERRORS_VERBOSE  :: 2;
+    PQERRORS_SQLSTATE :: 3;
 }
 
 PGContextVisibility :: enum u32 {
@@ -101,11 +134,26 @@ PGPing :: enum u32 {
     PQPING_NO_ATTEMPT  :: 3;
 }
 
+/*
+* PGpipelineStatus - Current status of pipeline mode
+*/
+PGpipelineStatus :: enum u32 {
+    PQ_PIPELINE_OFF     :: 0;
+    PQ_PIPELINE_ON      :: 1;
+    PQ_PIPELINE_ABORTED :: 2;
+}
+
 pg_conn :: struct {}
 /* PGconn encapsulates a connection to the backend.
 * The contents of this struct are not supposed to be known to applications.
 */
 PGconn :: pg_conn;
+
+pg_cancel_conn :: struct {}
+/* PGcancelConn encapsulates a cancel connection to the backend.
+* The contents of this struct are not supposed to be known to applications.
+*/
+PGcancelConn :: pg_cancel_conn;
 
 pg_result :: struct {}
 /* PGresult encapsulates the result of a query (or more precisely, of a single
@@ -143,6 +191,9 @@ pgNotify :: struct {
 * whereas in earlier versions it was always your own backend's PID.
 */
 PGnotify :: pgNotify;
+
+/* pg_usec_time_t is like time_t, but with microsecond resolution */
+pg_usec_time_t :: pg_int64;
 
 /* Function types for notice-handling callbacks */
 PQnoticeReceiver :: #type (arg: *void, res: *PGresult) -> void #c_call;
@@ -266,7 +317,7 @@ PQconninfo :: (conn: *PGconn) -> *PQconninfoOption #foreign libpq;
 PQconninfoFree :: (connOptions: *PQconninfoOption) -> void #foreign libpq;
 
 /*
-* close the current connection and restablish a new one with the same
+* close the current connection and reestablish a new one with the same
 * parameters
 */
 /* Asynchronous (non-blocking) */
@@ -276,16 +327,33 @@ PQresetPoll :: (conn: *PGconn) -> PostgresPollingStatusType #foreign libpq;
 /* Synchronous (blocking) */
 PQreset :: (conn: *PGconn) -> void #foreign libpq;
 
+/* Create a PGcancelConn that's used to cancel a query on the given PGconn */
+PQcancelCreate :: (conn: *PGconn) -> *PGcancelConn #foreign libpq;
+
+/* issue a cancel request in a non-blocking manner */
+PQcancelStart :: (cancelConn: *PGcancelConn) -> s32 #foreign libpq;
+
+/* issue a blocking cancel request */
+PQcancelBlocking :: (cancelConn: *PGcancelConn) -> s32 #foreign libpq;
+
+/* poll a non-blocking cancel request */
+PQcancelPoll :: (cancelConn: *PGcancelConn) -> PostgresPollingStatusType #foreign libpq;
+PQcancelStatus :: (cancelConn: *PGcancelConn) -> ConnStatusType #foreign libpq;
+PQcancelSocket :: (cancelConn: *PGcancelConn) -> s32 #foreign libpq;
+PQcancelErrorMessage :: (cancelConn: *PGcancelConn) -> *u8 #foreign libpq;
+PQcancelReset :: (cancelConn: *PGcancelConn) -> void #foreign libpq;
+PQcancelFinish :: (cancelConn: *PGcancelConn) -> void #foreign libpq;
+
 /* request a cancel structure */
 PQgetCancel :: (conn: *PGconn) -> *PGcancel #foreign libpq;
 
 /* free a cancel structure */
 PQfreeCancel :: (cancel: *PGcancel) -> void #foreign libpq;
 
-/* issue a cancel request */
+/* deprecated version of PQcancelBlocking, but one which is signal-safe */
 PQcancel :: (cancel: *PGcancel, errbuf: *u8, errbufsize: s32) -> s32 #foreign libpq;
 
-/* backwards compatible version of PQcancel; not thread-safe */
+/* deprecated version of PQcancel; not thread-safe */
 PQrequestCancel :: (conn: *PGconn) -> s32 #foreign libpq;
 
 /* Accessor functions for PGconn objects */
@@ -293,6 +361,7 @@ PQdb :: (conn: *PGconn) -> *u8 #foreign libpq;
 PQuser :: (conn: *PGconn) -> *u8 #foreign libpq;
 PQpass :: (conn: *PGconn) -> *u8 #foreign libpq;
 PQhost :: (conn: *PGconn) -> *u8 #foreign libpq;
+PQhostaddr :: (conn: *PGconn) -> *u8 #foreign libpq;
 PQport :: (conn: *PGconn) -> *u8 #foreign libpq;
 PQtty :: (conn: *PGconn) -> *u8 #foreign libpq;
 PQoptions :: (conn: *PGconn) -> *u8 #foreign libpq;
@@ -305,8 +374,10 @@ PQserverVersion :: (conn: *PGconn) -> s32 #foreign libpq;
 PQerrorMessage :: (conn: *PGconn) -> *u8 #foreign libpq;
 PQsocket :: (conn: *PGconn) -> s32 #foreign libpq;
 PQbackendPID :: (conn: *PGconn) -> s32 #foreign libpq;
+PQpipelineStatus :: (conn: *PGconn) -> PGpipelineStatus #foreign libpq;
 PQconnectionNeedsPassword :: (conn: *PGconn) -> s32 #foreign libpq;
 PQconnectionUsedPassword :: (conn: *PGconn) -> s32 #foreign libpq;
+PQconnectionUsedGSSAPI :: (conn: *PGconn) -> s32 #foreign libpq;
 PQclientEncoding :: (conn: *PGconn) -> s32 #foreign libpq;
 PQsetClientEncoding :: (conn: *PGconn, encoding: *u8) -> s32 #foreign libpq;
 
@@ -326,15 +397,17 @@ PQinitSSL :: (do_init: s32) -> void #foreign libpq;
 /* More detailed way to tell libpq whether it needs to initialize OpenSSL */
 PQinitOpenSSL :: (do_ssl: s32, do_crypto: s32) -> void #foreign libpq;
 
+/* Return true if GSSAPI encryption is in use */
+PQgssEncInUse :: (conn: *PGconn) -> s32 #foreign libpq;
+
+/* Returns GSSAPI context if GSSAPI is in use */
+PQgetgssctx :: (conn: *PGconn) -> *void #foreign libpq;
+
 /* Set verbosity for PQerrorMessage and PQresultErrorMessage */
 PQsetErrorVerbosity :: (conn: *PGconn, verbosity: PGVerbosity) -> PGVerbosity #foreign libpq;
 
 /* Set CONTEXT visibility for PQerrorMessage and PQresultErrorMessage */
 PQsetErrorContextVisibility :: (conn: *PGconn, show_context: PGContextVisibility) -> PGContextVisibility #foreign libpq;
-
-/* Enable/disable tracing */
-PQtrace :: (conn: *PGconn, debug_port: *FILE) -> void #foreign libpq;
-PQuntrace :: (conn: *PGconn) -> void #foreign libpq;
 
 /* Override default notice handling routines */
 PQsetNoticeReceiver :: (conn: *PGconn, proc: PQnoticeReceiver, arg: *void) -> PQnoticeReceiver #foreign libpq;
@@ -352,6 +425,12 @@ pgthreadlock_t :: #type (acquire: s32) -> void #c_call;
 
 PQregisterThreadLock :: (newhandler: pgthreadlock_t) -> pgthreadlock_t #foreign libpq;
 
+/* === in fe-trace.c === */
+PQtrace :: (conn: *PGconn, debug_port: *FILE) -> void #foreign libpq;
+PQuntrace :: (conn: *PGconn) -> void #foreign libpq;
+
+PQsetTraceFlags :: (conn: *PGconn, flags: s32) -> void #foreign libpq;
+
 /* Simple synchronous query */
 PQexec :: (conn: *PGconn, query: *u8) -> *PGresult #foreign libpq;
 PQexecParams :: (conn: *PGconn, command: *u8, nParams: s32, paramTypes: *Oid, paramValues: **u8, paramLengths: *s32, paramFormats: *s32, resultFormat: s32) -> *PGresult #foreign libpq;
@@ -360,7 +439,6 @@ PQprepare :: (conn: *PGconn, stmtName: *u8, query: *u8, nParams: s32, paramTypes
 
 PQexecPrepared :: (conn: *PGconn, stmtName: *u8, nParams: s32, paramValues: **u8, paramLengths: *s32, paramFormats: *s32, resultFormat: s32) -> *PGresult #foreign libpq;
 
-/* Interface for multiple-result or asynchronous queries */
 PQsendQuery :: (conn: *PGconn, query: *u8) -> s32 #foreign libpq;
 PQsendQueryParams :: (conn: *PGconn, command: *u8, nParams: s32, paramTypes: *Oid, paramValues: **u8, paramLengths: *s32, paramFormats: *s32, resultFormat: s32) -> s32 #foreign libpq;
 
@@ -369,11 +447,19 @@ PQsendPrepare :: (conn: *PGconn, stmtName: *u8, query: *u8, nParams: s32, paramT
 PQsendQueryPrepared :: (conn: *PGconn, stmtName: *u8, nParams: s32, paramValues: **u8, paramLengths: *s32, paramFormats: *s32, resultFormat: s32) -> s32 #foreign libpq;
 
 PQsetSingleRowMode :: (conn: *PGconn) -> s32 #foreign libpq;
+PQsetChunkedRowsMode :: (conn: *PGconn, chunkSize: s32) -> s32 #foreign libpq;
 PQgetResult :: (conn: *PGconn) -> *PGresult #foreign libpq;
 
 /* Routines for managing an asynchronous query */
 PQisBusy :: (conn: *PGconn) -> s32 #foreign libpq;
 PQconsumeInput :: (conn: *PGconn) -> s32 #foreign libpq;
+
+/* Routines for pipeline mode management */
+PQenterPipelineMode :: (conn: *PGconn) -> s32 #foreign libpq;
+PQexitPipelineMode :: (conn: *PGconn) -> s32 #foreign libpq;
+PQpipelineSync :: (conn: *PGconn) -> s32 #foreign libpq;
+PQsendFlushRequest :: (conn: *PGconn) -> s32 #foreign libpq;
+PQsendPipelineSync :: (conn: *PGconn) -> s32 #foreign libpq;
 
 /* LISTEN/NOTIFY support */
 PQnotifies :: (conn: *PGconn) -> *PGnotify #foreign libpq;
@@ -384,7 +470,7 @@ PQputCopyEnd :: (conn: *PGconn, errormsg: *u8) -> s32 #foreign libpq;
 PQgetCopyData :: (conn: *PGconn, buffer: **u8, async: s32) -> s32 #foreign libpq;
 
 /* Deprecated routines for copy in/out */
-PQgetline :: (conn: *PGconn, _string: *u8, length: s32) -> s32 #foreign libpq;
+PQgetline :: (conn: *PGconn, buffer: *u8, length: s32) -> s32 #foreign libpq;
 PQputline :: (conn: *PGconn, _string: *u8) -> s32 #foreign libpq;
 PQgetlineAsync :: (conn: *PGconn, buffer: *u8, bufsize: s32) -> s32 #foreign libpq;
 PQputnbytes :: (conn: *PGconn, buffer: *u8, nbytes: s32) -> s32 #foreign libpq;
@@ -440,6 +526,12 @@ PQdescribePortal :: (conn: *PGconn, portal: *u8) -> *PGresult #foreign libpq;
 PQsendDescribePrepared :: (conn: *PGconn, stmt: *u8) -> s32 #foreign libpq;
 PQsendDescribePortal :: (conn: *PGconn, portal: *u8) -> s32 #foreign libpq;
 
+/* Close prepared statements and portals */
+PQclosePrepared :: (conn: *PGconn, stmt: *u8) -> *PGresult #foreign libpq;
+PQclosePortal :: (conn: *PGconn, portal: *u8) -> *PGresult #foreign libpq;
+PQsendClosePrepared :: (conn: *PGconn, stmt: *u8) -> s32 #foreign libpq;
+PQsendClosePortal :: (conn: *PGconn, portal: *u8) -> s32 #foreign libpq;
+
 /* Delete a PGresult */
 PQclear :: (res: *PGresult) -> void #foreign libpq;
 
@@ -450,44 +542,45 @@ PQfreemem :: (ptr: *void) -> void #foreign libpq;
 PQmakeEmptyPGresult :: (conn: *PGconn, status: ExecStatusType) -> *PGresult #foreign libpq;
 PQcopyResult :: (src: *PGresult, flags: s32) -> *PGresult #foreign libpq;
 PQsetResultAttrs :: (res: *PGresult, numAttributes: s32, attDescs: *PGresAttDesc) -> s32 #foreign libpq;
-PQresultAlloc :: (res: *PGresult, nBytes: size_t) -> *void #foreign libpq;
+PQresultAlloc :: (res: *PGresult, nBytes: u64) -> *void #foreign libpq;
+PQresultMemorySize :: (res: *PGresult) -> u64 #foreign libpq;
 PQsetvalue :: (res: *PGresult, tup_num: s32, field_num: s32, value: *u8, len: s32) -> s32 #foreign libpq;
 
 /* Quoting strings before inclusion in queries. */
-PQescapeStringConn :: (conn: *PGconn, to: *u8, from: *u8, length: size_t, error: *s32) -> size_t #foreign libpq;
+PQescapeStringConn :: (conn: *PGconn, to: *u8, from: *u8, length: u64, error: *s32) -> u64 #foreign libpq;
 
-PQescapeLiteral :: (conn: *PGconn, str: *u8, len: size_t) -> *u8 #foreign libpq;
-PQescapeIdentifier :: (conn: *PGconn, str: *u8, len: size_t) -> *u8 #foreign libpq;
-PQescapeByteaConn :: (conn: *PGconn, from: *u8, from_length: size_t, to_length: *size_t) -> *u8 #foreign libpq;
+PQescapeLiteral :: (conn: *PGconn, str: *u8, len: u64) -> *u8 #foreign libpq;
+PQescapeIdentifier :: (conn: *PGconn, str: *u8, len: u64) -> *u8 #foreign libpq;
+PQescapeByteaConn :: (conn: *PGconn, from: *u8, from_length: u64, to_length: *u64) -> *u8 #foreign libpq;
 
-PQunescapeBytea :: (strtext: *u8, retbuflen: *size_t) -> *u8 #foreign libpq;
+PQunescapeBytea :: (strtext: *u8, retbuflen: *u64) -> *u8 #foreign libpq;
 
 /* These forms are deprecated! */
-PQescapeString :: (to: *u8, from: *u8, length: size_t) -> size_t #foreign libpq;
-PQescapeBytea :: (from: *u8, from_length: size_t, to_length: *size_t) -> *u8 #foreign libpq;
+PQescapeString :: (to: *u8, from: *u8, length: u64) -> u64 #foreign libpq;
+PQescapeBytea :: (from: *u8, from_length: u64, to_length: *u64) -> *u8 #foreign libpq;
 
 /* === in fe-print.c === */
-PQprint :: (fout: *FILE, res: *PGresult, ps: *PQprintOpt) -> void #foreign libpq;
+PQprint :: (fout: *FILE, res: *PGresult, po: *PQprintOpt) -> void #foreign libpq;
 
 /*
 * really old printing routines
 */
 PQdisplayTuples :: (res: *PGresult, fp: *FILE, fillAlign: s32, fieldSep: *u8, printHeader: s32, quiet: s32) -> void #foreign libpq;
 
-PQprintTuples :: (res: *PGresult, fout: *FILE, printAttName: s32, terseOutput: s32, width: s32) -> void #foreign libpq;
+PQprintTuples :: (res: *PGresult, fout: *FILE, PrintAttNames: s32, TerseOutput: s32, colWidth: s32) -> void #foreign libpq;
 
 /* Large-object access routines */
 lo_open :: (conn: *PGconn, lobjId: Oid, mode: s32) -> s32 #foreign libpq;
 lo_close :: (conn: *PGconn, fd: s32) -> s32 #foreign libpq;
-lo_read :: (conn: *PGconn, fd: s32, buf: *u8, len: size_t) -> s32 #foreign libpq;
-lo_write :: (conn: *PGconn, fd: s32, buf: *u8, len: size_t) -> s32 #foreign libpq;
+lo_read :: (conn: *PGconn, fd: s32, buf: *u8, len: u64) -> s32 #foreign libpq;
+lo_write :: (conn: *PGconn, fd: s32, buf: *u8, len: u64) -> s32 #foreign libpq;
 lo_lseek :: (conn: *PGconn, fd: s32, offset: s32, whence: s32) -> s32 #foreign libpq;
 lo_lseek64 :: (conn: *PGconn, fd: s32, offset: pg_int64, whence: s32) -> pg_int64 #foreign libpq;
 lo_creat :: (conn: *PGconn, mode: s32) -> Oid #foreign libpq;
 lo_create :: (conn: *PGconn, lobjId: Oid) -> Oid #foreign libpq;
 lo_tell :: (conn: *PGconn, fd: s32) -> s32 #foreign libpq;
 lo_tell64 :: (conn: *PGconn, fd: s32) -> pg_int64 #foreign libpq;
-lo_truncate :: (conn: *PGconn, fd: s32, len: size_t) -> s32 #foreign libpq;
+lo_truncate :: (conn: *PGconn, fd: s32, len: u64) -> s32 #foreign libpq;
 lo_truncate64 :: (conn: *PGconn, fd: s32, len: pg_int64) -> s32 #foreign libpq;
 lo_unlink :: (conn: *PGconn, lobjId: Oid) -> s32 #foreign libpq;
 lo_import :: (conn: *PGconn, filename: *u8) -> Oid #foreign libpq;
@@ -497,8 +590,17 @@ lo_export :: (conn: *PGconn, lobjId: Oid, filename: *u8) -> s32 #foreign libpq;
 /* Get the version of the libpq library in use */
 PQlibVersion :: () -> s32 #foreign libpq;
 
+/* Poll a socket for reading and/or writing with an optional timeout */
+PQsocketPoll :: (sock: s32, forRead: s32, forWrite: s32, end_time: pg_usec_time_t) -> s32 #foreign libpq;
+
+/* Get current time in the form PQsocketPoll wants */
+PQgetCurrentTimeUSec :: () -> pg_usec_time_t #foreign libpq;
+
 /* Determine length of multibyte encoded char at *s */
 PQmblen :: (s: *u8, encoding: s32) -> s32 #foreign libpq;
+
+/* Same, but not more than the distance to the end of string s */
+PQmblenBounded :: (s: *u8, encoding: s32) -> s32 #foreign libpq;
 
 /* Determine display length of multibyte encoded char at *s */
 PQdsplen :: (s: *u8, encoding: s32) -> s32 #foreign libpq;
@@ -509,14 +611,19 @@ PQenv2encoding :: () -> s32 #foreign libpq;
 /* === in fe-auth.c === */
 PQencryptPassword :: (passwd: *u8, user: *u8) -> *u8 #foreign libpq;
 PQencryptPasswordConn :: (conn: *PGconn, passwd: *u8, user: *u8, algorithm: *u8) -> *u8 #foreign libpq;
+PQchangePassword :: (conn: *PGconn, user: *u8, passwd: *u8) -> *PGresult #foreign libpq;
 
 /* === in encnames.c === */
 pg_char_to_encoding :: (name: *u8) -> s32 #foreign libpq;
 pg_encoding_to_char :: (encoding: s32) -> *u8 #foreign libpq;
 pg_valid_server_encoding_id :: (encoding: s32) -> s32 #foreign libpq;
 
+/* Support for overriding sslpassword handling with a callback */
+PQsslKeyPassHook_OpenSSL_type :: #type (buf: *u8, size: s32, conn: *PGconn) -> s32 #c_call;
+PQgetSSLKeyPassHook_OpenSSL :: () -> PQsslKeyPassHook_OpenSSL_type #foreign libpq;
+PQsetSSLKeyPassHook_OpenSSL :: (hook: PQsslKeyPassHook_OpenSSL_type) -> void #foreign libpq;
+PQdefaultSSLKeyPassHook_OpenSSL :: (buf: *u8, size: s32, conn: *PGconn) -> s32 #foreign libpq;
+
 #scope_file
 
-
-libpq :: #system_library "libpq";
-
+libpq :: #library,no_dll "libpq";

@@ -1,5 +1,9 @@
 #module_parameters ()(SUPPORT_DATE_AS_STRINGS := false); // SUPPORT_DATE requires https://github.com/rluba/jai-date, at least for now.
 
+// Those are variables because we need to take their addresses
+BOOL_TRUE_VALUE : u8 = 1;
+BOOL_FALSE_VALUE: u8 = 0;
+
 connect :: (conn_str: string) -> *PGconn, success: bool {
     conn_c_str := to_c_string(conn_str);
     defer free(conn_c_str);
@@ -23,6 +27,69 @@ connect :: (conn_str: string) -> *PGconn, success: bool {
         return conn, false;
     }
     return conn, true;
+}
+
+connect_start :: (conn_str: string) -> ok: bool, *PGconn {
+
+    pgconn := PQconnectStart(temp_c_string(conn_str));
+
+    if PQstatus(pgconn) == ConnStatusType.CONNECTION_BAD {
+
+        log("failed to start postgres connection", flags=.ERROR);
+        PQfinish(pgconn);
+        return false, null;
+    }
+
+    return true, pgconn;
+}
+
+connect_tick :: (pgconn: *PGconn) -> ok: bool, done: bool {
+
+    // The docs talk about sockets this and that, but it seems that socket checks
+    // here are for the app so it can sleep and not poll libpq, but libpq itself doesn't
+    // mind being polled all the time.
+    //
+    // All this to say, we don't waste our time with that here.
+    result := PQconnectPoll(pgconn);
+
+    if result == .PGRES_POLLING_FAILED {
+        log("failed to establish postgres connection in connect_tick with status=%", PQstatus(pgconn), flags=.ERROR);
+        return false, false;
+    }
+
+    if result == .PGRES_POLLING_OK {
+        return true, true;
+    }
+
+    return true, false;
+}
+
+reset_start :: (pgconn: *PGconn) -> ok: bool {
+
+    status := PQresetStart(pgconn);
+
+    return status == 1;
+}
+
+reset_tick :: (pgconn: *PGconn) -> ok: bool, done: bool {
+
+    // The docs talk about sockets this and that, but it seems that socket checks
+    // here are for the app so it can sleep and not poll libpq, but libpq itself doesn't
+    // mind being polled all the time.
+    //
+    // All this to say, we don't waste our time with that here.
+    result := PQresetPoll(pgconn);
+
+    if result == .PGRES_POLLING_FAILED {
+        log("failed to reset postgres connection with status=%", PQstatus(pgconn), flags=.ERROR);
+        return false, false;
+    }
+
+    if result == .PGRES_POLLING_OK {
+        return true, true;
+    }
+
+    return true, false;
 }
 
 disconnect :: (conn: *PGconn) {
@@ -65,77 +132,314 @@ execute :: (conn: *PGconn, command: string, args: .. Any) -> success: bool, upda
     return success, update_rows;
 }
 
-send_query :: (conn: *PGconn, command: string, args: .. Any) -> success: bool {
+execute_async :: (conn: *PGconn, command: string, args: ..Any) -> ok: bool {
+
+    ok := send_query(conn, command, ..args);
+    if !ok {
+        return false;
+    }
+
+    return true;
+}
+
+execute_async_raw :: (conn: *PGconn, command: string) -> ok: bool {
+
+    ok := send_query_raw(conn, command);
+    if !ok {
+        return false;
+    }
+
+    return true;
+}
+
+execute_async_params :: (conn: *PGconn, command: string, param_types: []Oid, param_values: []*u8, param_lengths: []s32, param_formats: []s32) -> ok: bool {
+
+    ok := send_query_params(conn, command, param_types, param_values, param_lengths, param_formats);
+    if !ok {
+
+        error_message: string;
+        error_message.data = PQerrorMessage(conn);
+        error_message.count = c_style_strlen(error_message.data);
+        log_error("Could not send query: %", error_message);
+        return false;
+    }
+
+    return true;
+}
+
+query_results_ready :: (conn: *PGconn) -> (success: bool, ready: bool) {
+
+    code := PQconsumeInput(conn);
+    if code != 1 {
+        err := read_latest_error(conn);
+        log_error("calling PQconsumeInput in has_results failed with code=% and err=%", code, err);
+        return false, false;
+    }
+
+    ready_to_read := !is_busy(conn);
+    return true, ready_to_read;
+}
+
+is_busy :: inline (conn: *PGconn) -> bool {
+    return PQisBusy(conn) == 1;
+}
+
+// Parse results of a previously sent statement
+read_query_results :: (conn: *PGconn, $T: Type, $$ignore_unknown := false) -> [] T, success: bool {
+
+    results: [] T;
+    query_res := get_last_query_result(conn);
+
+    // No async query was run
+    if !query_res {
+        return results, false;
+    }
+
+    defer PQclear(query_res);
+
+    has_results, success := check_query_result(query_res);
+    if !success return results, false;
+
+    if has_results {
+        results, success = get_results(query_res, T, ignore_unknown);
+    }
+
+    return results, success;
+}
+
+read_query_results_no_parse :: (conn: *PGconn) -> success: bool, has_results: bool, pgresult: *PGresult, updated_rows: int {
+
+    query_res := get_last_query_result(conn);
+
+    // No async query was run
+    if !query_res {
+        return false, false, null, 0;
+    }
+
+    has_results, success, updated_rows := check_query_result(query_res);
+    return success, has_results, query_res, updated_rows;
+}
+
+read_query_results :: (conn: *PGconn) -> success: bool, update_rows: int {
+
+    query_res := get_last_query_result(conn);
+
+    // No async query was run
+    if !query_res {
+        return results, false;
+    }
+
+    defer PQclear(query_res);
+
+    has_results, success, update_rows := check_query_result(query_res);
+    return success, update_rows;
+}
+
+// The returned string should NOT be freed, and should be
+// considered invalid after the next connection operation.
+read_latest_error :: inline (conn: *PGconn) -> string {
+    err_msg: string = ---;
+    err_msg.data = PQerrorMessage(conn);
+    err_msg.count = c_style_strlen(err_msg.data);
+
+    return err_msg;
+}
+
+type_to_pq_type :: (ti: *Type_Info) -> (success: bool, Pq_Type) {
+
+    if ti.type == {
+        case .INTEGER;
+
+            info := ti.(*Type_Info_Integer);
+
+            // @TODO: implement unsigned ints
+            assert(info.signed, "Unsigned not yet supported");
+
+            if info.runtime_size == {
+                case 2;
+                    return true, Pq_Type.INT2;
+                case 4;
+                    return true, Pq_Type.INT4;
+                case 8;
+                    return true, Pq_Type.INT8;
+                case;
+                    return false, 0;
+            }
+
+        case .FLOAT;
+
+            if ti.runtime_size == {
+                case 4;
+                    return true, Pq_Type.FLOAT4;
+                case 8;
+                    return true, Pq_Type.FLOAT8;
+                case;
+                    return false, 0;
+            }
+
+        case .STRING;
+            return true, Pq_Type.TEXT;
+
+        case .BOOL;
+            return true, Pq_Type.BOOL;
+
+        case;
+            log_error("failed to convert type=% to Pq_Type because type is unknown or unhandled", ti.type);
+            return false, 0;
+    }
+}
+
+send_query_raw :: (conn: *PGconn, command: string) -> success: bool {
+
+    // Alloc in case it's big
+    c_command := to_c_string(command);
+    defer free(c_command);
+
+    result := PQsendQuery(conn, c_command);
+    if result == 0 {
+        error_msg := to_string(PQerrorMessage(conn));
+        log("failed postgres send_query_raw. Error = %; Query = %", error_msg, command, flags=.ERROR);
+        return false;
+    }
+
+    return true;
+}
+
+send_query :: (conn: *PGconn, command: string, args: ..Any) -> success: bool {
+
     pool: Pool;
-    set_allocators(*pool);
+    set_allocators(*pool, Context_Base.default_allocator);
     defer release(*pool);
 
     push_allocator(pool_allocator_proc, *pool);
+
+    ok, param_types, param_values, param_lengths, param_formats := pg_query_args_to_send_params(..args);
+    if !ok return false;
+
+    ok = inline send_query_params(conn, command, param_types, param_values, param_lengths, param_formats);
+    return ok;
+}
+
+send_query_params :: (conn: *PGconn, command: string, param_types: []Oid, param_values: []*u8, param_lengths: []s32, param_formats: []s32) -> success: bool {
+
+    // Alloc in case it's big
+    c_command := to_c_string(command);
+    defer free(c_command);
+
+    result := PQsendQueryParams(conn, c_command, param_types.count.(s32,no_check), param_types.data, param_values.data, param_lengths.data, param_formats.data, 1);
+    if result == 0 {
+        error_msg := to_string(PQerrorMessage(conn));
+        log("failed postgres send_query. Error = %; Query = %", error_msg, command, flags=.ERROR);
+        return false;
+    }
+
+    return true;
+}
+
+pg_query_args_to_send_params :: (args: ..Any) -> ok: bool, param_types: []Oid=.[], param_values: []*u8=.[], param_lengths: []s32=.[], param_formats: []s32=.[] {
 
     param_types   := NewArray(args.count, Oid, initialized = false);
     param_values  := NewArray(args.count, *u8, initialized = false);
     param_lengths := NewArray(args.count, s32, initialized = false);
     param_formats := NewArray(args.count, s32, initialized = false);
 
-    for arg, index: args {
+    for arg_original, index: args {
+
+        arg := arg_original; // Shadow to handle pointers if needed
+
+        // Handle (one level of) pointers by dereferencing into the underlying type
+        if arg.type.type == .POINTER {
+
+            underlying_ti := arg.type.(*Type_Info_Pointer).pointer_to;
+
+            // Handle null pointers
+            if !arg.value_pointer.(**void).* {
+
+                success, postgres_type := type_to_pq_type(underlying_ti);
+                if !success {
+                    log("failed postgres pg_query_args_to_send_params because of unsupported type: pointer of % in arg[%]=%", underlying_ti.*, index, arg, flags=.ERROR);
+                    return false;
+                }
+
+                param_types[index] = postgres_type.(Oid);
+                param_values[index] = null;
+                param_lengths[index] = 0;
+                param_formats[index] = 1;
+                continue;
+            }
+
+            // Non-null pointer so update arg to be the underlying value and type
+            arg.type = underlying_ti;
+            arg.value_pointer = arg.value_pointer.(**void).*;
+        }
+
         if arg.type.type == {
+
+            case .ENUM; #through;
             case .INTEGER;
-                info := cast(*Type_Info_Integer) arg.type;
-                // @ToDo: implement unsigned ints
-                assert(info.signed, "Unsigned not yet supported");
-                be_value := cast(*u8) alloc(info.runtime_size);
+
+                info := ifx arg.type.type == .ENUM then arg.type.(*Type_Info_Enum).internal_type else arg.type.(*Type_Info_Integer);
+
+                // @TODO: implement unsigned ints
+                if !info.signed {
+                    log("failed postgres pg_query_args_to_send_params because arg with index=% is an unsigned integer, which isn't supported yet. Type info=%", index, info.*, flags=.ERROR);
+                    return false;
+                }
+
+                be_value := alloc(info.runtime_size).(*u8);
                 if info.runtime_size == {
                     case 2;
-                        param_types[index] = cast(Oid) Pq_Type.INT2;
-                        be_val := hton((.*)(cast(*s16) arg.value_pointer));
+                        param_types[index] = Pq_Type.INT2.(Oid);
+                        be_val := hton(arg.value_pointer.(*s16).*);
                         memcpy(be_value, *be_val, info.runtime_size);
                     case 4;
-                        param_types[index] = cast(Oid) Pq_Type.INT4;
-                        be_val := hton((.*)(cast(*s32) arg.value_pointer));
+                        param_types[index] = Pq_Type.INT4.(Oid);
+                        be_val := hton(arg.value_pointer.(*s32).*);
                         memcpy(be_value, *be_val, info.runtime_size);
                     case 8;
-                        param_types[index] = cast(Oid) Pq_Type.INT8;
-                        be_val := hton((.*)(cast(*s64) arg.value_pointer));
+                        param_types[index] = Pq_Type.INT8.(Oid);
+                        be_val := hton(arg.value_pointer.(*s64).*);
                         memcpy(be_value, *be_val, info.runtime_size);
                     case;
-                        assert(false);
+                        log("failed pg_query_args_to_send_params because arg_type=% had an unexpected runtime_size=%", arg.type.type, info.runtime_size, flags=.ERROR);
+                        return false;
                 }
                 param_values[index] = be_value;
-                param_lengths[index] = cast(s32) info.runtime_size;
+                param_lengths[index] = info.runtime_size.(s32);
                 param_formats[index] = 1;
 
             case .FLOAT;
-                be_value := cast(*u8) alloc(arg.type.runtime_size);
+                be_value := alloc(arg.type.runtime_size).(*u8);
                 if arg.type.runtime_size == 4 {
-                    param_types[index] = cast(Oid) Pq_Type.FLOAT4;
-                    be_val := hton((.*)(cast(*float) arg.value_pointer));
+                    param_types[index] = Pq_Type.FLOAT4.(Oid);
+                    be_val := hton(arg.value_pointer.(*float).*);
                     memcpy(be_value, *be_val, arg.type.runtime_size);
                 }
                 if arg.type.runtime_size == 8 {
-                    param_types[index] = cast(Oid) Pq_Type.FLOAT8;
-                    be_val := hton((.*)(cast(*float64) arg.value_pointer));
+                    param_types[index] = Pq_Type.FLOAT8.(Oid);
+                    be_val := hton(arg.value_pointer.(*float64).*);
                     memcpy(be_value, *be_val, arg.type.runtime_size);
                 }
-                param_values[index]  = be_value;
-                param_lengths[index] = cast(s32) arg.type.runtime_size;
+                param_values[index] = be_value;
+                param_lengths[index] = arg.type.runtime_size.(s32);
                 param_formats[index] = 1;
 
             case .STRING;
-                str := cast(*string) arg.value_pointer;
-                param_types[index]   = cast(Oid) Pq_Type.TEXT;
-                param_values[index]  = ifx str.data else ""; // This handles empty strings. Sending no data means null string
-                param_lengths[index] = cast(s32) str.count;
+                str := arg.value_pointer.(*string);
+                param_types[index] = Pq_Type.TEXT.(Oid);
+                param_values[index] = ifx str.data else ""; // This handles empty strings. Sending no data means null string
+                param_lengths[index] = str.count.(s32);
                 param_formats[index] = 1;
 
             case .BOOL;
-                val := cast(*bool) arg.value_pointer;
-                param_types[index]   = cast(Oid) Pq_Type.BOOL;
-                param_values[index]  = ifx val.* then *BOOL_TRUE_VALUE else *BOOL_FALSE_VALUE;
+                val := ifx arg.value_pointer.(*bool);
+                param_types[index] = Pq_Type.BOOL.(Oid);
+                param_values[index] = ifx val.* then *BOOL_TRUE_VALUE else *BOOL_FALSE_VALUE;;
                 param_lengths[index] = 1;
                 param_formats[index] = 1;
 
             // case .ARRAY;
-                // @ToDo: Implement binary format according to array_recv format.
+                // @TODO: Implement binary format according to array_recv format.
                 // See https://doxygen.postgresql.org/arrayfuncs_8c.html#a315b67e6e01e8f283326b5a6b27e07c9
                 //
                 // Format seems to be:
@@ -156,25 +460,12 @@ send_query :: (conn: *PGconn, command: string, args: .. Any) -> success: bool {
             // ToDo: Struct as Jsonb?
 
             case;
-                // @ToDo: Implement
-                log_error("Unsupported param type: %", arg.type.type);
+                log("failed pg_query_args_to_send_params because arg at index=% is of an unsupported param type=%", index, arg.type.type, flags=.ERROR);
                 return false;
         }
     }
 
-    c_command := to_c_string(command);
-
-    result: int;
-    result = PQsendQueryParams(conn, c_command, cast(s32) args.count, param_types.data, param_values.data, param_lengths.data, param_formats.data, 1);
-    if result == 0 {
-        error_message: string;
-        error_message.data = PQerrorMessage(conn);
-        error_message.count = c_style_strlen(error_message.data);
-        log_error("Could not send query: %", error_message);
-        return false;
-    }
-
-    return true;
+    return true, param_types, param_values, param_lengths, param_formats;
 }
 
 
@@ -190,6 +481,7 @@ get_last_query_result :: (conn: *PGconn) -> *PGresult {
     return query_result;
 }
 
+// @bloeys: I removed logs from here because we don't want noise. The user can use PGresult to do whatever they want.
 check_query_result :: (query_res: *PGresult) -> has_results: bool, success: bool, updated_rows: int {
     res_status := PQresultStatus(query_res);
     if res_status == {
@@ -203,20 +495,20 @@ check_query_result :: (query_res: *PGresult) -> has_results: bool, success: bool
         case ExecStatusType.PGRES_TUPLES_OK;
             return true, true, 0;
         case ExecStatusType.PGRES_FATAL_ERROR;
-            error_message := to_string(PQresultErrorMessage(query_res));
-            log_error("Fatal error: %", error_message);
+            // error_message := to_string(PQresultErrorMessage(query_res));
+            // log_error("Fatal error: %", error_message);
             return false, false, 0;
         case ExecStatusType.PGRES_NONFATAL_ERROR;
-            error_message := to_string(PQresultErrorMessage(query_res));
-            log_error("Non-fatal error: %", error_message);
+            // error_message := to_string(PQresultErrorMessage(query_res));
+            // log_error("Non-fatal error: %", error_message);
             return false, false, 0;
         case;
-            log_error("Query result status: %", res_status);
+            // log_error("Query result status: %", res_status);
             return false, false, 0;
     }
 }
 
-get_results :: (query_res: *PGresult, $T: Type, $ignore_unknown := false) -> [] T, success: bool {
+get_results :: (query_res: *PGresult, $T: Type, $$ignore_unknown := false) -> [] T, success: bool {
     raw_result, success := get_results(query_res, type_info(T), ignore_unknown);
 
     results: []T;
@@ -233,19 +525,23 @@ Member_Offset :: struct {
 get_results :: (query_res: *PGresult, info: *Type_Info, ignore_unknown := false) -> Array_View_64, success: bool {
     // @ToDo: Allow to cast single-column results directly to primitive types
     assert(info.type == .STRUCT);
-    info_struct := cast(*Type_Info_Struct) info;
+    info_struct := info.(*Type_Info_Struct);
+    initializer := info_struct.initializer;
 
     num_tuples := PQntuples(query_res);
     results: Array_View_64;
-    results.data = alloc(info.runtime_size * num_tuples);
-    results.count = num_tuples;
-    initializer := info_struct.initializer;
-    if !initializer {
-        memset(results.data, 0, info.runtime_size * num_tuples);
+    // This check is to keep flat_pool happy, as the memory debugger in beta 0.2.010 complains with 0-byte allocs on flat_pool.
+    // Aside from the flat_pool thing, this check isn't really needed
+    if num_tuples > 0 {
+        results.data = alloc(info.runtime_size * num_tuples);
+        results.count = num_tuples;
+        if !initializer {
+            memset(results.data, 0, info.runtime_size * num_tuples);
+        }
     }
 
     num_columns := PQnfields(query_res);
-    column_members := NewArray(num_columns, Member_Offset, initialized = false);
+    column_members := NewArray(num_columns, Member_Offset, initialized = false,, Context_Base.default_allocator);
     defer array_free(column_members);
 
     for col: 0..num_columns - 1 {
@@ -257,7 +553,7 @@ get_results :: (query_res: *PGresult, info: *Type_Info, ignore_unknown := false)
             log_error("Column \"%\" has no corresponding member in struct type \"%\"", name, info_struct.*);
             return results, false;
         }
-        column_members[col] = .{member, offset_in_bytes};
+        column_members[col] = {member, offset_in_bytes};
     }
 
     for row: 0..num_tuples - 1 {
@@ -276,7 +572,7 @@ get_results :: (query_res: *PGresult, info: *Type_Info, ignore_unknown := false)
                 len := PQgetlength(query_res, row, col);
                 data := PQgetvalue(query_res, row, col);
                 slot := row_data + member_offset.offset_in_bytes;
-                success := assign_member(member_offset.member.name, member_offset.member.type, slot, cast(Pq_Type) type, len, data, row, col);
+                success := assign_member(member_offset.member.name, member_offset.member.type, slot, type.(Pq_Type), len, data, row, col);
                 if !success        return results, false;
             }
         }
@@ -288,23 +584,26 @@ get_results :: (query_res: *PGresult, info: *Type_Info, ignore_unknown := false)
 #scope_module
 
 assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, len: int, data: *u8, row: int, col: int) -> bool {
+
+    info = variant_to_base_type_info(info);
+
     if col_type == {
         case .INT2;
             assert(len == 2);
             // Explicitly throwing away 48 bits.
-            val := ntoh((.*) cast(*s16) data);
+            val := ntoh(data.(*s16).*);
             return write_integer(col, name, info, slot, col_type, val);
 
         case .OID; #through;
         case .INT4;
             assert(len == 4);
             // Explicitly throwing away 32 bits.
-            val := ntoh((.*) cast(*s32) data);
+            val := ntoh(data.(*s32).*);
             return write_integer(col, name, info, slot, col_type, val);
 
         case .INT8;
             assert(len == 8);
-            val := ntoh((.*) cast(*s64) data);
+            val := ntoh(data.(*s64).*);
             return write_integer(col, name, info, slot, col_type, val);
 
         case .FLOAT4;
@@ -314,10 +613,10 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
             }
 
             if info.runtime_size == 4 {
-                (.*) (cast(*float32) slot) = ntoh((.*)(cast(*float32) data));
+                slot.(*float32).* = ntoh(data.(*float32).*);
             } else {
                 assert(info.runtime_size == 8);
-                (.*) (cast(*float64) slot) = cast(float64) ntoh((.*)(cast(*float32) data));
+                slot.(*float64).* = ntoh(data.(*float32).*).(float64);
             }
             return true;
 
@@ -328,10 +627,10 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
             }
 
             if info.runtime_size == 4 {
-                (.*) (cast(*float32) slot) = cast(float32) ntoh((.*)(cast(*float64) data));
+                slot.(*float32).* = ntoh(data.(*float64).*).(float32);
             } else {
                 assert(info.runtime_size == 8);
-                (.*) (cast(*float64) slot) = ntoh((.*)(cast(*float64) data));
+                slot.(*float64).* = ntoh(data.(*float64).*);
             }
             return true;
 
@@ -341,7 +640,7 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
                 return false;
             }
             success: bool;
-            (.*) (cast(*string) slot), success = str_from_numeric(data, len, row, col);
+            slot.(*string).*, success = str_from_numeric(data, len, row, col);
             return success;
 
         case .BOOL;
@@ -351,8 +650,8 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
                 return false;
             }
 
-            val := (.*) cast(*u8) data;
-            (.*) (cast(*bool) slot) = (val != 0);
+            val := data.(*u8).*;
+            slot.(*bool).* = (val != 0);
 
             return true;
 
@@ -369,7 +668,7 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
 
         case .DATE;
             assert(len == 4);
-            days_since_2000_01_01 := ntoh((.*) cast(*s32) data);
+            days_since_2000_01_01 := ntoh(data.(*s32).*);
             if info.type == Type_Info_Tag.INTEGER {
                 return write_integer(col, name, info, slot, col_type, days_since_2000_01_01);
             } else {
@@ -378,11 +677,11 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
                     date := Date.{2000, 1, 1};
                     add(*date, days_since_2000_01_01, .DAY);
                     if info == type_info(Date) {
-                        target := cast(*Date) slot;
+                        target := slot.(*Date);
                         target.* = date;
                         return true;
                     } else if info == type_info(Apollo_Time) {
-                        target := cast(*Apollo_Time) slot;
+                        target := slot.(*Apollo_Time);
                         target.* = to_apollo_time(date);
                         return true;
                     } else {
@@ -396,7 +695,7 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
             }
         case .TIMESTAMP;   #through;
         case .TIMESTAMPTZ;
-            val := ntoh((.*) cast(*s64) data);
+            val := ntoh(data.(*s64).*);
             // shift from 2000 to 1970
             val += 946_684_800_000000;
             if info.type == .STRING || info == type_info(Apollo_Time) {
@@ -406,7 +705,7 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
                 apollo := a_seconds + a_nanoseconds + APOLLO_TIME_FOR_JAN_1_1970;
 
                 if info == type_info(Apollo_Time) {
-                    target := cast(*Apollo_Time) slot;
+                    target := slot.(*Apollo_Time);
                     target.* = apollo;
                     return true;
                 } else {
@@ -418,10 +717,10 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
                 return write_integer(col, name, info, slot, col_type, val);
             }
 
-        case .UUID; #through; // UUIDs are simplye [16]u8, returned from postgres as a byte array
+        case .UUID; #through;
         case .BYTEA;
             if info.type == .ARRAY {
-                array_info := cast(*Type_Info_Array) info;
+                array_info := info.(*Type_Info_Array);
                 element_size := array_info.element_type.runtime_size;
                 assert(element_size != -1);
                 if element_size != 1 {
@@ -431,12 +730,12 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
 
                 dest_data_pointer: *void;
                 if array_info.array_type == .VIEW {
-                    view := (cast(*Array_View_64) slot);
+                    view := slot.(*Array_View_64);
                     view.count = len;
                     view.data = alloc(len * element_size);
                     dest_data_pointer = view.data;
                 } else if array_info.array_count == -1 {
-                    resizable_array := cast(*Resizable_Array) slot;
+                    resizable_array := slot.(*Resizable_Array);
                     array_reserve(resizable_array, len, element_size);
                     resizable_array.count = len;
                     dest_data_pointer = resizable_array.data;
@@ -463,7 +762,7 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
                 return it.handler(name, info, slot, col_type, len, data, row, col);
             }
 
-            if cast(s64) col_type > enum_highest_value(Pq_Type) {
+            if col_type.(s64) > enum_highest_value(Pq_Type) {
                 // Seems to be a custom type. Try to interpret it as a string
                 val: string;
                 val.data = data;
@@ -477,12 +776,13 @@ assign_member :: (name: string, info: *Type_Info, slot: *u8, col_type: Pq_Type, 
 }
 
 write_string_value :: (col: int, name: string, info: *Type_Info, slot: *void, col_type: Pq_Type, value: string, is_custom: bool) -> bool {
+
     if info.type == {
         case .STRING;
-            (.*) (cast(*string) slot) = copy_string(value);
+            slot.(*string).* = copy_string(value);
             return true;
         case .ENUM;
-            info_enum := cast(*Type_Info_Enum) info;
+            info_enum := info.(*Type_Info_Enum);
             for info_enum.names {
                 if it == value {
                     return write_integer(col, name, info_enum.internal_type, slot, col_type, info_enum.values[it_index]);
@@ -502,11 +802,12 @@ write_string_value :: (col: int, name: string, info: *Type_Info, slot: *void, co
 }
 
 write_integer :: (col: int, name: string, info: *Type_Info, pointer: *void, col_type: Pq_Type, value: s64) -> bool {
-    if info.type != Type_Info_Tag.INTEGER {
+
+    if info.type != Type_Info_Tag.INTEGER && info.type != .ENUM {
         log_error("Error: Trying to write column % of type % as an integer into member field \"%\" of type %", col, col_type, name, info.type);
         return false;
     }
-    int_info := cast(*Type_Info_Integer) info;
+    int_info := info.(*Type_Info_Integer);
 
     if int_info.signed {
         valid, low, high := Reflection.range_check_and_store(value, int_info, pointer);
@@ -516,7 +817,7 @@ write_integer :: (col: int, name: string, info: *Type_Info, pointer: *void, col_
             return false;
         }
     } else {
-        valid, low, high := Reflection.range_check_and_store(cast(u64) value, int_info, pointer);  // Different overload from the above!
+        valid, low, high := Reflection.range_check_and_store(value.(u64), int_info, pointer);  // Different overload from the above!
 
         if !valid {
             log_error("Value % of column % is out of range for \"%\". (The value must be between % and %.)", value, col, name, low, high);
@@ -533,10 +834,10 @@ str_from_numeric :: (data: *u8, len: int, row: int, col: int) -> string, success
         return "", false;
     }
 
-    num_digits := ntoh((.*) cast(*u16) data);
-    weight := ntoh((.*) cast(*s16) (data + 2));
-    sign := ntoh((.*) cast(*u16) (data + 4));
-    dscale := ntoh((.*) cast(*u16) (data + 6));
+    num_digits := ntoh(data.(*u16).*);
+    weight := ntoh((data + 2).(*s16).*);
+    sign := ntoh((data + 4).(*u16).*);
+    dscale := ntoh((data + 6).(*u16).*);
     if len != num_digits * 2 + 8 {
         log_error("Invalid numeric length at row % col %: %", row, col, len);
         return "", false;
@@ -567,7 +868,7 @@ str_from_numeric :: (data: *u8, len: int, row: int, col: int) -> string, success
     if weight >= 0 && num_digits {
         min_digits := 1;
         while weight >= 0 && index < num_digits {
-            digit := ntoh((.*) cast(*s16) (data + 8 + index * 2));
+            digit := ntoh((data + 8 + index * 2).(*s16).*);
             print_to_builder(*builder, "%", formatInt(digit, minimum_digits=min_digits));
             min_digits = 4;
             weight -= 1;
@@ -587,7 +888,7 @@ str_from_numeric :: (data: *u8, len: int, row: int, col: int) -> string, success
     omitted := -1 - weight;
     if omitted > 0 {
         zeros: int;
-        if 4 * omitted > cast(s32) dscale {
+        if 4 * omitted > dscale.(s32) {
             zeros = dscale;
         } else {
             zeros = 4 * omitted;
@@ -597,7 +898,7 @@ str_from_numeric :: (data: *u8, len: int, row: int, col: int) -> string, success
     }
     min_digits := 4;
     while index < num_digits {
-        digit := ntoh((.*) cast(*s16) (data + 8 + index * 2));
+        digit := ntoh((data + 8 + index * 2).(*s16).*);
         if dec_len + 4 > dscale {
             remaining := dscale - dec_len;
             assert(remaining > 0, "Unexpected number of remaining digits: %", remaining);
@@ -615,8 +916,17 @@ str_from_numeric :: (data: *u8, len: int, row: int, col: int) -> string, success
     return builder_to_string(*builder), true;
 }
 
-BOOL_TRUE_VALUE:  u8 = 1;
-BOOL_FALSE_VALUE: u8 = 0;
+variant_to_base_type_info :: inline (info: *Type_Info) -> *Type_Info {
+
+	// Info can be null sometimes so make sure before checking type
+	if !info return null;
+
+	while info.type == .VARIANT {
+		info = info.(*Type_Info_Variant).variant_of;
+	}
+
+	return info;
+}
 
 #import "Basic";
 #import "Pool";
@@ -628,10 +938,17 @@ Reflection :: #import "Reflection";
 
 #if OS == .WINDOWS {
     Windows :: #import "Windows";
-    #load "bindings/windows.jai";
+    #load "bindings/windows/windows.jai";
+
     size_t :: Windows.size_t;
     FILE :: *void;
-} else {
+
+} else #if OS == .LINUX {
     #import "POSIX";
-    #load "bindings/unix.jai";
+    #load "bindings/linux/unix.jai";
+} else {
+    // @TODO: This uses the system library, but ideally
+    // we ship our own, just we do for linux.
+    #import "POSIX";
+    #load "bindings/macos/unix.jai";
 }

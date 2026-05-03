@@ -51,7 +51,7 @@ generate_bindings :: () -> bool {
 			array_add(*libpaths, "/usr/local/homebrew/opt/libpq/lib");
             output_filename          = "bindings/unix.jai";
 			generate_library_declarations = false;
-			footer = FOOTER_UNIX;
+			footer = FOOTER_MACOS;
         } else {
             assert(false);
         }
@@ -171,6 +171,21 @@ FOOTER_UNIX :: #string END
 
 libpq :: #system_library "libpq";
 
+END
+
+FOOTER_MACOS :: #string END
+libpq :: #library,no_dll "libpq";
+
+libpgport_shlib :: #library,no_dll,link_always "libpgport_shlib";
+libpgcommon_shlib :: #library,no_dll,link_always "libpgcommon_shlib";
+
+libcrypto :: #library,no_dll,link_always "libcrypto";
+libssl :: #library,no_dll,link_always "libssl";
+
+liblber :: #library,no_dll,link_always "liblber";
+libldap :: #library,no_dll,link_always "libldap";
+libsasl :: #library,link_always "libsasl2.3";
+kerberos :: #library,system,link_always "Kerberos";
 END
 
 FOOTER_WIN :: #string END
